@@ -1,0 +1,1593 @@
+import { Router, Request, Response } from 'express';
+import { dbStore } from '../db/store';
+import { DailyBeneficiaryRecord, BeneficiaryGroup, BeneficiaryLocation, BeneficiaryAuditLog, BastDocument, KategoriLembaga } from '../../src/types';
+import { syncSaveDoc, syncDeleteDoc, syncSaveBatch } from '../db/firestore';
+import { createBastWordDocument } from '../../src/utils/bastDocxGenerator';
+import { Packer } from 'docx';
+
+const router = Router();
+
+// Helper to clean, re-index urutan sequentially (#1, #2, ... #10, #11, ...), and sanitize subtotal portion counts
+function cleanDuplicateGroupsAndLocations() {
+  // 1. Deduplicate beneficiaryGroups strictly by unique ID (never delete groups by name, support unlimited groups)
+  const uniqueGroups: BeneficiaryGroup[] = [];
+  const seenGroupIds = new Set<string>();
+
+  // Sort by existing urutan first so existing order is preserved
+  const sorted = [...dbStore.beneficiaryGroups].sort((a, b) => (a.urutan || 0) - (b.urutan || 0));
+
+  sorted.forEach((g) => {
+    if (!g.id) {
+      g.id = `GRP-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    }
+    if (seenGroupIds.has(g.id)) {
+      return;
+    }
+    seenGroupIds.add(g.id);
+    uniqueGroups.push(g);
+  });
+
+  // Re-index urutan sequentially starting from 1 (#1, #2, #3, ... #10, #11, ...)
+  // When there is only 1 group, its urutan is always 1 (#1). Groups can be 10 or more without limitation.
+  uniqueGroups.forEach((g, idx) => {
+    const correctUrutan = idx + 1;
+    if (g.urutan !== correctUrutan) {
+      g.urutan = correctUrutan;
+      syncSaveDoc('beneficiaryGroups', g.id, g);
+    }
+  });
+
+  // Sanitize every group's lembagaList and sync corresponding location data
+  uniqueGroups.forEach((g) => {
+    if (Array.isArray(g.lembagaList) && g.lembagaList.length > 0) {
+      g.lembagaList.forEach((item: any, lIdx: number) => {
+        const itemKlas = item.klasifikasiPorsi || g.klasifikasiPorsi || 'Porsi Besar';
+        const normInstansi = (item.namaInstansi || '').trim().toLowerCase();
+
+        // Harmonize target fields based on classification or name
+        if (itemKlas === 'Porsi Ibu Hamil' || normInstansi.includes('ibu hamil') || (normInstansi.includes('hamil') && !normInstansi.includes('menyusui'))) {
+          const val = Number(item.targetBumilBusui) || Number(item.targetSiswa) || 0;
+          item.targetBumilBusui = val;
+          item.targetSiswa = 0;
+          item.targetBalita = 0;
+        } else if (itemKlas === 'Porsi Ibu Menyusui' || normInstansi.includes('ibu menyusui') || normInstansi.includes('menyusui')) {
+          const val = Number(item.targetBumilBusui) || Number(item.targetSiswa) || 0;
+          item.targetBumilBusui = val;
+          item.targetSiswa = 0;
+          item.targetBalita = 0;
+        } else if (itemKlas === 'Porsi Balita' || itemKlas === 'Balita' || normInstansi.includes('balita')) {
+          const val = Number(item.targetBalita) || Number(item.targetSiswa) || 0;
+          item.targetBalita = val;
+          item.targetSiswa = 0;
+          item.targetBumilBusui = 0;
+        }
+
+        const is3BItem = item.kategoriLembaga?.includes('3B') || normInstansi.includes('3b') || g.kategoriLembaga?.includes('3B') || (g.nama && g.nama.includes('3B'));
+        if (is3BItem) {
+          const bd = item.breakdownKelas || {};
+          const kL = Number(bd.kader_l) || 0;
+          const kP = Number(bd.kader_p) || 0;
+          const kTot = kL + kP || Number(bd.kader) || 0;
+          item.targetGuru = kTot;
+          item.targetSiswa = 0;
+        }
+
+        const s = is3BItem ? 0 : (Number(item.targetSiswa) || 0);
+        const guru = is3BItem ? (Number(item.targetGuru) || 0) : (Number(item.targetGuru) || 0);
+        const balita = Number(item.targetBalita) || 0;
+        const bumil = Number(item.targetBumilBusui) || 0;
+        const accurateTotal = s + guru + balita + bumil;
+        item.total = accurateTotal;
+
+        // Also fix the matching location if it exists
+        const locId = item.id || `LOC-${g.id}-${lIdx + 1}`;
+        const locIdx = dbStore.beneficiaryLocations.findIndex(
+          l => l.id === locId || (l.groupId === g.id && l.namaInstansi.trim().toLowerCase() === item.namaInstansi.trim().toLowerCase())
+        );
+
+        if (locIdx !== -1) {
+          const loc = dbStore.beneficiaryLocations[locIdx];
+          loc.defaultJumlah = accurateTotal;
+          loc.klasifikasiPorsi = itemKlas;
+          loc.kategoriBreakdown = {
+            siswa: is3BItem ? 0 : s,
+            guru: is3BItem ? (Number(item.targetGuru) || 0) : guru,
+            kader: is3BItem ? (Number(item.targetGuru) || 0) : 0,
+            balita: balita,
+            ibuHamil: (itemKlas === 'Porsi Ibu Hamil' || normInstansi.includes('hamil')) ? bumil : (itemKlas === 'Bumil & Busui' ? Math.ceil(bumil / 2) : 0),
+            ibuMenyusui: (itemKlas === 'Porsi Ibu Menyusui' || normInstansi.includes('menyusui')) ? bumil : (itemKlas === 'Bumil & Busui' ? Math.floor(bumil / 2) : 0)
+          };
+          syncSaveDoc('beneficiaryLocations', loc.id, loc);
+        }
+      });
+      syncSaveDoc('beneficiaryGroups', g.id, g);
+    }
+  });
+
+  // Also sanitize any existing dailyBeneficiaryRecords for 3B that might have had the artificial 8 guru
+  dbStore.dailyBeneficiaryRecords.forEach((rec) => {
+    const is3BRec = (rec.kategoriLembaga && rec.kategoriLembaga.includes('3B')) ||
+                    (rec.groupNama && rec.groupNama.includes('3B')) ||
+                    (rec.namaInstansi && (rec.namaInstansi.toLowerCase().includes('posyandu') || rec.namaInstansi.toLowerCase().includes('temenggungan')));
+    if (is3BRec && rec.rincianSasaran) {
+      const bd = rec.breakdownKelas || rec.rincianSasaran?.breakdownKelas || {};
+      const kL = Number(bd.kader_l) || 0;
+      const kP = Number(bd.kader_p) || 0;
+      const realKader = kL + kP || Number(bd.kader) || 0;
+      if (realKader === 0 && rec.rincianSasaran.guru === 8) {
+        rec.rincianSasaran.guru = 0;
+        const b = Number(rec.rincianSasaran.balita) || 0;
+        const ih = Number(rec.rincianSasaran.ibuHamil) || 0;
+        const im = Number(rec.rincianSasaran.ibuMenyusui) || 0;
+        rec.totalPenerima = b + ih + im;
+        rec.jumlahAwal = rec.totalPenerima;
+        syncSaveDoc('dailyBeneficiaryRecords', rec.id, rec);
+      }
+    }
+  });
+
+  dbStore.beneficiaryGroups = uniqueGroups;
+
+  // 2. Deduplicate beneficiaryLocations by normalized (groupId + namaInstansi)
+  const uniqueLocations: BeneficiaryLocation[] = [];
+  const locMap = new Map<string, BeneficiaryLocation>();
+
+  dbStore.beneficiaryLocations.forEach((l) => {
+    const key = `${(l.groupId || '').trim().toLowerCase()}::${(l.namaInstansi || '').trim().toLowerCase()}`;
+    if (!l.namaInstansi) return;
+
+    if (locMap.has(key)) {
+      const existing = locMap.get(key)!;
+      if (l.id !== existing.id) {
+        syncDeleteDoc('beneficiaryLocations', l.id);
+      }
+    } else {
+      locMap.set(key, l);
+      uniqueLocations.push(l);
+    }
+  });
+
+  dbStore.beneficiaryLocations = uniqueLocations;
+}
+
+// Initial sanitize on startup
+cleanDuplicateGroupsAndLocations();
+
+// 1. GET GROUPS
+router.get('/groups', (req: Request, res: Response): void => {
+  const sorted = [...dbStore.beneficiaryGroups].sort((a, b) => (a.urutan || 0) - (b.urutan || 0));
+  res.json({
+    success: true,
+    data: sorted
+  });
+});
+
+// Helper for Updating Group & Lembaga List
+async function updateGroupHandler(id: string, body: any, res: Response): Promise<void> {
+  const { nama, kategoriUtama, kategoriLembaga, klasifikasiPorsi, deskripsi, alamat, status, lembagaList, picNama, nomorKontak, picKontak } = body;
+  const idx = dbStore.beneficiaryGroups.findIndex(g => g.id === id);
+  if (idx === -1) {
+    res.status(404).json({ success: false, message: 'Kelompok tidak ditemukan' });
+    return;
+  }
+
+  const existingGroup = dbStore.beneficiaryGroups[idx];
+  const updatedNama = nama || existingGroup.nama;
+
+  const updatedGroup: BeneficiaryGroup = {
+    ...existingGroup,
+    nama: updatedNama,
+    kategoriUtama: kategoriUtama || existingGroup.kategoriUtama,
+    kategoriLembaga: kategoriLembaga || existingGroup.kategoriLembaga,
+    klasifikasiPorsi: klasifikasiPorsi || existingGroup.klasifikasiPorsi,
+    alamat: alamat !== undefined ? alamat : (deskripsi !== undefined ? deskripsi : existingGroup.alamat),
+    deskripsi: deskripsi !== undefined ? deskripsi : (alamat !== undefined ? alamat : existingGroup.deskripsi),
+    picNama: picNama !== undefined ? picNama : existingGroup.picNama,
+    nomorKontak: nomorKontak !== undefined ? nomorKontak : (picKontak !== undefined ? picKontak : existingGroup.nomorKontak),
+    picKontak: picKontak !== undefined ? picKontak : (nomorKontak !== undefined ? nomorKontak : existingGroup.picKontak),
+    status: status || existingGroup.status,
+    lembagaList: Array.isArray(lembagaList) ? lembagaList : existingGroup.lembagaList
+  };
+
+  dbStore.beneficiaryGroups[idx] = updatedGroup;
+  await syncSaveDoc('beneficiaryGroups', id, updatedGroup);
+
+  // If lembagaList provided, sync locations
+  if (Array.isArray(lembagaList)) {
+    const todayStr = new Date().toISOString().split('T')[0];
+    
+    // Get existing locations for this group
+    const groupLocs = dbStore.beneficiaryLocations.filter(
+      l => l.groupId === id || l.groupNama.trim().toLowerCase() === existingGroup.nama.trim().toLowerCase()
+    );
+
+    const updatedLocIds = new Set<string>();
+
+    for (let lIdx = 0; lIdx < lembagaList.length; lIdx++) {
+      const item = lembagaList[lIdx];
+      const itemKlas = item.klasifikasiPorsi || klasifikasiPorsi || updatedGroup.klasifikasiPorsi || 'Porsi Besar';
+      let targetSiswa = Number(item.targetSiswa) || 0;
+      let targetGuru = Number(item.targetGuru) || 0;
+      let targetBalita = Number(item.targetBalita) || 0;
+      let targetBumilBusui = Number(item.targetBumilBusui) || 0;
+
+      const normInstansi = (item.namaInstansi || '').trim().toLowerCase();
+      let ibuHamil = 0;
+      let ibuMenyusui = 0;
+      let balita = 0;
+      let siswa = 0;
+
+      if (item.kategoriLembaga?.includes('3B') || normInstansi.includes('3b') || (item.breakdownKelas && (item.breakdownKelas.baduta !== undefined || item.breakdownKelas.bumil !== undefined || item.breakdownKelas.busui_w !== undefined))) {
+        const bd = item.breakdownKelas || {};
+        const tBalita511 = (Number(bd.balita511_l) || 0) + (Number(bd.balita511_p) || 0) || Number(bd.baduta) || 0;
+        const tBalita1259 = (Number(bd.balita1259_l) || 0) + (Number(bd.balita1259_p) || 0) || Number(bd.balita) || 0;
+        const tBusui = Number(bd.busui_w) || Number(bd.busui) || 0;
+        const tBumil = Number(bd.bumil_w) || Number(bd.bumil) || 0;
+        const tKader = (Number(bd.kader_l) || 0) + (Number(bd.kader_p) || 0) || Number(bd.kader) || 0;
+
+        balita = (tBalita511 + tBalita1259) || Number(targetBalita) || 0;
+        ibuHamil = tBumil || Math.ceil((Number(targetBumilBusui) || 0) / 2);
+        ibuMenyusui = tBusui || Math.floor((Number(targetBumilBusui) || 0) / 2);
+        targetGuru = tKader;
+        targetBalita = balita;
+        targetBumilBusui = ibuHamil + ibuMenyusui;
+        targetSiswa = 0;
+      } else if (itemKlas === 'Porsi Ibu Hamil' || normInstansi.includes('ibu hamil') || (normInstansi.includes('hamil') && !normInstansi.includes('menyusui'))) {
+        const val = targetBumilBusui || targetSiswa || 0;
+        ibuHamil = val;
+        targetBumilBusui = val;
+        targetSiswa = 0;
+        targetBalita = 0;
+      } else if (itemKlas === 'Porsi Ibu Menyusui' || normInstansi.includes('ibu menyusui') || normInstansi.includes('menyusui')) {
+        const val = targetBumilBusui || targetSiswa || 0;
+        ibuMenyusui = val;
+        targetBumilBusui = val;
+        targetSiswa = 0;
+        targetBalita = 0;
+      } else if (itemKlas === 'Bumil & Busui') {
+        const val = targetBumilBusui || targetSiswa || 0;
+        ibuHamil = Math.ceil(val / 2);
+        ibuMenyusui = Math.floor(val / 2);
+        targetBumilBusui = val;
+        targetSiswa = 0;
+        targetBalita = 0;
+      } else if (itemKlas === 'Porsi Balita' || itemKlas === 'Balita' || normInstansi.includes('balita')) {
+        const val = targetBalita || targetSiswa || 0;
+        balita = val;
+        targetBalita = val;
+        targetSiswa = 0;
+        targetBumilBusui = 0;
+      } else {
+        siswa = targetSiswa;
+      }
+
+      const accurateTotal = targetSiswa + targetGuru + targetBalita + targetBumilBusui;
+      item.total = accurateTotal;
+      item.targetSiswa = targetSiswa;
+      item.targetGuru = targetGuru;
+      item.targetBalita = targetBalita;
+      item.targetBumilBusui = targetBumilBusui;
+      item.klasifikasiPorsi = itemKlas;
+
+      // Match existing location by item.id, or by namaInstansi, or by position index
+      const matchedLoc = groupLocs.find(l => 
+        (item.id && l.id === item.id) ||
+        (item.namaInstansi && l.namaInstansi.trim().toLowerCase() === item.namaInstansi.trim().toLowerCase())
+      ) || groupLocs[lIdx];
+
+      const locId = item.id || matchedLoc?.id || `LOC-${id}-${lIdx + 1}`;
+      item.id = locId; // assign ID back into item
+
+      const locData: BeneficiaryLocation = {
+        id: locId,
+        groupId: id,
+        groupNama: updatedNama,
+        namaInstansi: item.namaInstansi || `${updatedNama} - Instansi ${lIdx + 1}`,
+        alamat: item.alamat || updatedGroup.alamat || 'Kecamatan Pajarakan / Krejengan, Kabupaten Probolinggo',
+        kontak: item.nomorKontak || item.picKontak || updatedGroup.nomorKontak || updatedGroup.picKontak || '',
+        picNama: item.picNama || updatedGroup.picNama || '',
+        picTelepon: item.nomorKontak || item.picKontak || updatedGroup.nomorKontak || updatedGroup.picKontak || '',
+        kategoriLembaga: item.kategoriLembaga || kategoriLembaga || updatedGroup.kategoriLembaga,
+        klasifikasiPorsi: itemKlas,
+        breakdownKelas: item.breakdownKelas || {},
+        kategoriBreakdown: {
+          siswa,
+          guru: targetGuru,
+          balita,
+          ibuHamil,
+          ibuMenyusui,
+          breakdownKelas: item.breakdownKelas || {}
+        },
+        defaultJumlah: accurateTotal,
+        status: 'Aktif'
+      };
+
+      updatedLocIds.add(locId);
+
+      const existingLocIdx = dbStore.beneficiaryLocations.findIndex(l => l.id === locId);
+      if (existingLocIdx !== -1) {
+        dbStore.beneficiaryLocations[existingLocIdx] = locData;
+      } else {
+        dbStore.beneficiaryLocations.push(locData);
+      }
+
+      await syncSaveDoc('beneficiaryLocations', locId, locData);
+
+      // Sync daily record for today if exists
+      const recIdx = dbStore.dailyBeneficiaryRecords.findIndex(
+        r => r.tanggal === todayStr && (r.locationId === locId || r.namaInstansi.trim().toLowerCase() === locData.namaInstansi.trim().toLowerCase())
+      );
+
+      if (recIdx !== -1) {
+        const existingRec = dbStore.dailyBeneficiaryRecords[recIdx];
+        if (existingRec.statusKbm !== 'Libur Full') {
+          existingRec.namaInstansi = locData.namaInstansi;
+          existingRec.kategoriLembaga = locData.kategoriLembaga;
+          existingRec.klasifikasiPorsi = locData.klasifikasiPorsi;
+          existingRec.breakdownKelas = locData.breakdownKelas;
+          existingRec.rincianSasaran = {
+            siswa,
+            guru: targetGuru,
+            balita,
+            ibuHamil,
+            ibuMenyusui,
+            breakdownKelas: locData.breakdownKelas
+          };
+          existingRec.jumlahAwal = locData.defaultJumlah;
+          existingRec.totalPenerima = Math.max(0, locData.defaultJumlah + (existingRec.penambahan || 0) - (existingRec.pengurangan || 0));
+          await syncSaveDoc('dailyBeneficiaryRecords', existingRec.id, existingRec);
+        }
+      }
+    }
+
+    // Remove any orphaned locations belonging to this group that are no longer in lembagaList
+    const orphanedLocs = groupLocs.filter(l => !updatedLocIds.has(l.id));
+    for (const o of orphanedLocs) {
+      const oIdx = dbStore.beneficiaryLocations.findIndex(l => l.id === o.id);
+      if (oIdx !== -1) {
+        dbStore.beneficiaryLocations.splice(oIdx, 1);
+      }
+      await syncDeleteDoc('beneficiaryLocations', o.id);
+    }
+
+    // Update group's stored lembagaList with IDs assigned
+    dbStore.beneficiaryGroups[idx].lembagaList = lembagaList;
+    await syncSaveDoc('beneficiaryGroups', id, dbStore.beneficiaryGroups[idx]);
+  }
+
+  cleanDuplicateGroupsAndLocations();
+
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Edit Kelompok', `Memperbarui kelompok: ${updatedNama}`);
+  res.json({ success: true, data: dbStore.beneficiaryGroups[idx], message: 'Kelompok dan spesifikasi lembaga sasaran berhasil diperbarui' });
+}
+
+// 2. POST GROUP (Create Group with optional Lembaga Sasaran list)
+router.post('/groups', async (req: Request, res: Response): Promise<void> => {
+  const { id, nama, kategoriUtama, kategoriLembaga, klasifikasiPorsi, deskripsi, alamat, status, lembagaList, picNama, nomorKontak, picKontak } = req.body;
+  const groupNama = (nama && nama.trim()) || `Kelompok Sasaran #${dbStore.beneficiaryGroups.length + 1}`;
+
+  // Only update if an explicit existing group ID was supplied
+  if (id) {
+    const existingIdx = dbStore.beneficiaryGroups.findIndex(g => g.id === id);
+    if (existingIdx !== -1) {
+      await updateGroupHandler(id, { ...req.body, nama: groupNama }, res);
+      return;
+    }
+  }
+
+  const groupId = id || `GRP-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+  const nextUrutan = dbStore.beneficiaryGroups.length + 1;
+  const newGroup: BeneficiaryGroup = {
+    id: groupId,
+    nama: groupNama,
+    kategoriUtama: kategoriUtama || 'Siswa',
+    kategoriLembaga: kategoriLembaga || 'SD / MI',
+    klasifikasiPorsi: klasifikasiPorsi || 'Porsi Besar',
+    alamat: alamat || deskripsi || '',
+    deskripsi: deskripsi || alamat || '',
+    picNama: picNama || '',
+    nomorKontak: nomorKontak || picKontak || '',
+    picKontak: picKontak || nomorKontak || '',
+    urutan: nextUrutan,
+    status: status || 'Aktif',
+    lembagaList: Array.isArray(lembagaList) ? lembagaList : []
+  };
+
+  dbStore.beneficiaryGroups.push(newGroup);
+  await syncSaveDoc('beneficiaryGroups', newGroup.id, newGroup);
+
+  if (Array.isArray(lembagaList) && lembagaList.length > 0) {
+    for (let idx = 0; idx < lembagaList.length; idx++) {
+      const item = lembagaList[idx];
+      const itemKlas = item.klasifikasiPorsi || klasifikasiPorsi || 'Porsi Besar';
+      let targetSiswa = Number(item.targetSiswa) || 0;
+      let targetGuru = Number(item.targetGuru) || 0;
+      let targetBalita = Number(item.targetBalita) || 0;
+      let targetBumilBusui = Number(item.targetBumilBusui) || 0;
+
+      const normInstansi = (item.namaInstansi || '').trim().toLowerCase();
+      let ibuHamil = 0;
+      let ibuMenyusui = 0;
+      let balita = 0;
+      let siswa = 0;
+
+      if (item.kategoriLembaga?.includes('3B') || normInstansi.includes('3b') || (item.breakdownKelas && (item.breakdownKelas.baduta !== undefined || item.breakdownKelas.bumil !== undefined || item.breakdownKelas.busui_w !== undefined))) {
+        const bd = item.breakdownKelas || {};
+        const tBalita511 = (Number(bd.balita511_l) || 0) + (Number(bd.balita511_p) || 0) || Number(bd.baduta) || 0;
+        const tBalita1259 = (Number(bd.balita1259_l) || 0) + (Number(bd.balita1259_p) || 0) || Number(bd.balita) || 0;
+        const tBusui = Number(bd.busui_w) || Number(bd.busui) || 0;
+        const tBumil = Number(bd.bumil_w) || Number(bd.bumil) || 0;
+        const tKader = (Number(bd.kader_l) || 0) + (Number(bd.kader_p) || 0) || Number(bd.kader) || 0;
+
+        balita = (tBalita511 + tBalita1259) || Number(targetBalita) || 0;
+        ibuHamil = tBumil || Math.ceil((Number(targetBumilBusui) || 0) / 2);
+        ibuMenyusui = tBusui || Math.floor((Number(targetBumilBusui) || 0) / 2);
+        targetGuru = tKader;
+        targetBalita = balita;
+        targetBumilBusui = ibuHamil + ibuMenyusui;
+        targetSiswa = 0;
+      } else if (itemKlas === 'Porsi Ibu Hamil' || normInstansi.includes('ibu hamil') || (normInstansi.includes('hamil') && !normInstansi.includes('menyusui'))) {
+        const val = targetBumilBusui || targetSiswa || 0;
+        ibuHamil = val;
+        targetBumilBusui = val;
+        targetSiswa = 0;
+        targetBalita = 0;
+      } else if (itemKlas === 'Porsi Ibu Menyusui' || normInstansi.includes('ibu menyusui') || normInstansi.includes('menyusui')) {
+        const val = targetBumilBusui || targetSiswa || 0;
+        ibuMenyusui = val;
+        targetBumilBusui = val;
+        targetSiswa = 0;
+        targetBalita = 0;
+      } else if (itemKlas === 'Bumil & Busui') {
+        const val = targetBumilBusui || targetSiswa || 0;
+        ibuHamil = Math.ceil(val / 2);
+        ibuMenyusui = Math.floor(val / 2);
+        targetBumilBusui = val;
+        targetSiswa = 0;
+        targetBalita = 0;
+      } else if (itemKlas === 'Porsi Balita' || itemKlas === 'Balita' || normInstansi.includes('balita')) {
+        const val = targetBalita || targetSiswa || 0;
+        balita = val;
+        targetBalita = val;
+        targetSiswa = 0;
+        targetBumilBusui = 0;
+      } else {
+        siswa = targetSiswa;
+      }
+
+      const accurateTotal = targetSiswa + targetGuru + targetBalita + targetBumilBusui;
+      item.total = accurateTotal;
+      item.targetSiswa = targetSiswa;
+      item.targetGuru = targetGuru;
+      item.targetBalita = targetBalita;
+      item.targetBumilBusui = targetBumilBusui;
+      item.klasifikasiPorsi = itemKlas;
+
+      const locId = item.id || `LOC-${groupId}-${idx + 1}`;
+      item.id = locId;
+
+      const locData: BeneficiaryLocation = {
+        id: locId,
+        groupId: groupId,
+        groupNama: groupNama,
+        namaInstansi: item.namaInstansi || `${groupNama} - Instansi ${idx + 1}`,
+        kategoriLembaga: item.kategoriLembaga || kategoriLembaga || newGroup.kategoriLembaga,
+        klasifikasiPorsi: itemKlas,
+        breakdownKelas: item.breakdownKelas || {},
+        kategoriBreakdown: {
+          siswa,
+          guru: targetGuru,
+          balita,
+          ibuHamil,
+          ibuMenyusui,
+          breakdownKelas: item.breakdownKelas || {}
+        },
+        defaultJumlah: accurateTotal,
+        status: 'Aktif'
+      };
+
+      const existingLocIdx = dbStore.beneficiaryLocations.findIndex(l => l.id === locId);
+      if (existingLocIdx !== -1) {
+        dbStore.beneficiaryLocations[existingLocIdx] = locData;
+      } else {
+        dbStore.beneficiaryLocations.push(locData);
+      }
+      await syncSaveDoc('beneficiaryLocations', locId, locData);
+    }
+
+    newGroup.lembagaList = lembagaList;
+    await syncSaveDoc('beneficiaryGroups', newGroup.id, newGroup);
+  }
+
+  cleanDuplicateGroupsAndLocations();
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Tambah Kelompok', `Menambahkan kelompok: ${groupNama} (${lembagaList?.length || 0} lembaga)`);
+  res.json({ success: true, data: newGroup, message: 'Kelompok dan spesifikasi lembaga sasaran berhasil disimpan' });
+});
+
+// 3. PUT GROUP (Update Group & Lembaga List)
+router.put('/groups/:id', async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+  await updateGroupHandler(id, req.body, res);
+});
+
+// DELETE ALL GROUPS (Clear all groups to start fresh)
+router.delete('/groups', async (req: Request, res: Response): Promise<void> => {
+  const count = dbStore.beneficiaryGroups.length;
+  const allGroups = [...dbStore.beneficiaryGroups];
+  dbStore.beneficiaryGroups = [];
+  for (const g of allGroups) {
+    await syncDeleteDoc('beneficiaryGroups', g.id);
+  }
+  const allLocs = [...dbStore.beneficiaryLocations];
+  dbStore.beneficiaryLocations = [];
+  for (const l of allLocs) {
+    await syncDeleteDoc('beneficiaryLocations', l.id);
+  }
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Hapus Semua Kelompok', `Menghapus seluruh kelompok (${count} kelompok)`);
+  res.json({ success: true, message: 'Seluruh kelompok penerima manfaat berhasil dihapus' });
+});
+
+// DELETE GROUP
+router.delete('/groups/:id', async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const idx = dbStore.beneficiaryGroups.findIndex(g => g.id === id);
+  let removedNama = id;
+
+  if (idx !== -1) {
+    const removed = dbStore.beneficiaryGroups.splice(idx, 1)[0];
+    removedNama = removed.nama;
+  }
+
+  // Always delete document from Firestore
+  await syncDeleteDoc('beneficiaryGroups', id);
+
+  // Remove associated locations
+  const locsToRemove = dbStore.beneficiaryLocations.filter(l => l.groupId === id);
+  dbStore.beneficiaryLocations = dbStore.beneficiaryLocations.filter(l => l.groupId !== id);
+  for (const l of locsToRemove) {
+    await syncDeleteDoc('beneficiaryLocations', l.id);
+  }
+
+  // Re-index remaining groups sequentially (#1, #2, ...)
+  cleanDuplicateGroupsAndLocations();
+
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Hapus Kelompok', `Menghapus kelompok: ${removedNama}`);
+  res.json({ success: true, message: `Kelompok "${removedNama}" berhasil dihapus` });
+});
+
+// 4. GET LOCATIONS
+router.get('/locations', (req: Request, res: Response): void => {
+  res.json({
+    success: true,
+    data: dbStore.beneficiaryLocations
+  });
+});
+
+// 5. POST LOCATION (Create Location)
+router.post('/locations', (req: Request, res: Response): void => {
+  const { groupId, groupNama, namaInstansi, alamat, kontak, kategoriBreakdown, defaultJumlah } = req.body;
+  if (!namaInstansi) {
+    res.status(400).json({ success: false, message: 'Nama instansi/lokasi wajib diisi' });
+    return;
+  }
+
+  // Check if location already exists
+  const existingIdx = dbStore.beneficiaryLocations.findIndex(
+    l => l.namaInstansi.trim().toLowerCase() === namaInstansi.trim().toLowerCase() && l.groupId === (groupId || 'GRP-001')
+  );
+
+  const locId = existingIdx !== -1 ? dbStore.beneficiaryLocations[existingIdx].id : `LOC-${Date.now()}`;
+
+  const locData: BeneficiaryLocation = {
+    id: locId,
+    groupId: groupId || 'GRP-001',
+    groupNama: groupNama || 'Umum',
+    namaInstansi,
+    alamat: alamat || '',
+    kontak: kontak || '',
+    kategoriBreakdown: kategoriBreakdown || {},
+    defaultJumlah: Number(defaultJumlah) || 0,
+    status: 'Aktif'
+  };
+
+  if (existingIdx !== -1) {
+    dbStore.beneficiaryLocations[existingIdx] = locData;
+  } else {
+    dbStore.beneficiaryLocations.push(locData);
+  }
+  syncSaveDoc('beneficiaryLocations', locId, locData);
+
+  cleanDuplicateGroupsAndLocations();
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Simpan Lokasi', `Menyimpan lokasi: ${namaInstansi}`);
+  res.json({ success: true, data: locData, message: 'Lokasi berhasil disimpan' });
+});
+
+// 6. PUT LOCATION (Update Location)
+router.put('/locations/:id', (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const idx = dbStore.beneficiaryLocations.findIndex(l => l.id === id);
+  if (idx === -1) {
+    res.status(404).json({ success: false, message: 'Lokasi tidak ditemukan' });
+    return;
+  }
+
+  dbStore.beneficiaryLocations[idx] = {
+    ...dbStore.beneficiaryLocations[idx],
+    ...req.body
+  };
+  syncSaveDoc('beneficiaryLocations', id, dbStore.beneficiaryLocations[idx]);
+
+  cleanDuplicateGroupsAndLocations();
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Edit Lokasi', `Memperbarui lokasi: ${dbStore.beneficiaryLocations[idx].namaInstansi}`);
+  res.json({ success: true, data: dbStore.beneficiaryLocations[idx], message: 'Lokasi berhasil diperbarui' });
+});
+
+// DELETE LOCATION
+router.delete('/locations/:id', (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const idx = dbStore.beneficiaryLocations.findIndex(l => l.id === id);
+  if (idx === -1) {
+    res.status(404).json({ success: false, message: 'Lokasi tidak ditemukan' });
+    return;
+  }
+
+  const removed = dbStore.beneficiaryLocations.splice(idx, 1)[0];
+  syncDeleteDoc('beneficiaryLocations', id);
+
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Hapus Lokasi', `Menghapus lokasi: ${removed.namaInstansi}`);
+  res.json({ success: true, message: `Lokasi "${removed.namaInstansi}" berhasil dihapus` });
+});
+
+// 7. GET DAILY RECORDS & SUMMARY BY DATE
+router.get('/by-date', (req: Request, res: Response): void => {
+  const todayStr = new Date().toISOString().split('T')[0];
+  const tanggal = (req.query.tanggal as string) || todayStr;
+  const finalOnly = req.query.finalOnly === 'true';
+
+  const allRecords = dbStore.getBeneficiaryRecordsForDate(tanggal);
+  const fullSummary = dbStore.getBeneficiarySummaryForDate(tanggal);
+
+  const hasPlanning = allRecords.length > 0;
+  const isDraft = hasPlanning && fullSummary.statusLock !== 'FINAL';
+
+  // If requested by Dashboard (finalOnly=true) and either no planning or still DRAFT, do not return records/totals
+  if (finalOnly && (!hasPlanning || isDraft)) {
+    res.json({
+      success: true,
+      tanggal,
+      hasPlanning,
+      isDraft,
+      draftCount: allRecords.length,
+      records: [],
+      summary: {
+        tanggal,
+        hasPlanning,
+        totalPenerima: 0,
+        totalPorsi: 0,
+        totalKelompok: 0,
+        totalInstansi: 0,
+        totalBalita: 0,
+        totalIbuHamil: 0,
+        totalIbuMenyusui: 0,
+        totalSiswa: 0,
+        totalGuru: 0,
+        portionBreakdown: {
+          porsiBesar: 0,
+          porsiKecil: 0,
+          porsiBalita: 0,
+          porsiIbuHamil: 0,
+          porsiIbuMenyusui: 0,
+          balita: 0,
+          bumilBusui: 0
+        },
+        statusLock: isDraft ? 'DRAFT' : 'DRAFT'
+      }
+    });
+    return;
+  }
+
+  res.json({
+    success: true,
+    tanggal,
+    hasPlanning,
+    isDraft,
+    draftCount: isDraft ? allRecords.length : 0,
+    records: allRecords,
+    summary: fullSummary
+  });
+});
+
+// 7b. POST PLAN (Save / Update Full Daily Beneficiary Planning from "Buat Penerima Manfaat")
+router.post('/plan', (req: Request, res: Response): void => {
+  const { tanggal, statusDoc, catatan, lembagaList, userName, userId } = req.body;
+  if (!tanggal || !Array.isArray(lembagaList) || lembagaList.length === 0) {
+    res.status(400).json({ success: false, message: 'Tanggal dan daftar lembaga sasaran wajib diisi' });
+    return;
+  }
+
+  const finalStatus: 'DRAFT' | 'FINAL' = statusDoc === 'FINAL' ? 'FINAL' : 'DRAFT';
+  const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const operatorName = userName || 'Operator';
+
+  // Remove existing records for this date
+  const oldRecords = dbStore.dailyBeneficiaryRecords.filter(r => r.tanggal === tanggal);
+  dbStore.dailyBeneficiaryRecords = dbStore.dailyBeneficiaryRecords.filter(r => r.tanggal !== tanggal);
+  oldRecords.forEach(old => syncDeleteDoc('dailyBeneficiaryRecords', old.id));
+
+  const newRecords: DailyBeneficiaryRecord[] = lembagaList.map((item: any, idx: number) => {
+    const itemKlas = item.klasifikasiPorsi || 'Porsi Besar';
+    const normInstansi = (item.namaInstansi || '').trim().toLowerCase();
+    const statusKbm: 'Aktif' | 'Libur Full' | 'Libur Sebagian' = item.statusKbm || 'Aktif';
+
+    let siswa = 0;
+    let guru = 0;
+    let balita = 0;
+    let ibuHamil = 0;
+    let ibuMenyusui = 0;
+    let kategori: DailyBeneficiaryRecord['kategori'] = 'Siswa';
+
+    const matchedLoc = dbStore.beneficiaryLocations.find(l => (item.id && l.id === item.id) || l.namaInstansi.trim().toLowerCase() === normInstansi);
+    const matchedGroup = dbStore.beneficiaryGroups.find(
+      g => (item.groupId && g.id === item.groupId) || (matchedLoc?.groupId && g.id === matchedLoc.groupId) || (g.nama && g.nama.toLowerCase() === (item.groupNama || '').toLowerCase())
+    );
+    const groupName = matchedGroup?.nama || matchedLoc?.groupNama || item.groupNama || itemKlas;
+    const itemCat: KategoriLembaga = item.kategoriLembaga || matchedLoc?.kategoriLembaga || matchedGroup?.kategoriLembaga || (normInstansi.includes('3b') ? '3B (Balita, Ibu Hamil & Ibu Menyusui)' : normInstansi.includes('sd') ? 'SD / MI' : 'SD / MI');
+    const bd = item.breakdownKelas || matchedLoc?.breakdownKelas || {};
+
+    const is3B = itemCat.includes('3B') || normInstansi.includes('3b');
+    if (statusKbm !== 'Libur Full') {
+      guru = Number(item.targetGuru) || 0;
+
+      if (is3B) {
+        const tBalita511 = (Number(bd.balita511_l) || 0) + (Number(bd.balita511_p) || 0) || Number(bd.baduta) || 0;
+        const tBalita1259 = (Number(bd.balita1259_l) || 0) + (Number(bd.balita1259_p) || 0) || Number(bd.balita) || 0;
+        const tBusui = Number(bd.busui_w) || Number(bd.busui) || 0;
+        const tBumil = Number(bd.bumil_w) || Number(bd.bumil) || 0;
+        const tKader = (Number(bd.kader_l) || 0) + (Number(bd.kader_p) || 0) || Number(bd.kader) || 0;
+
+        balita = (tBalita511 + tBalita1259) || Number(item.targetBalita) || 0;
+        ibuHamil = tBumil || Math.ceil((Number(item.targetBumilBusui) || 0) / 2);
+        ibuMenyusui = tBusui || Math.floor((Number(item.targetBumilBusui) || 0) / 2);
+
+        guru = tKader;
+        siswa = 0;
+        kategori = 'Balita';
+      } else {
+        const computeBreakdownTotal = (breakdown: Record<string, any>): number => {
+          if (!breakdown || typeof breakdown !== 'object') return 0;
+          const baseKeys = new Set<string>();
+          for (const k of Object.keys(breakdown)) {
+            baseKeys.add(k.replace(/_(l|p|w)$/, ''));
+          }
+          let total = 0;
+          for (const base of baseKeys) {
+            const hasGender =
+              breakdown[`${base}_l`] !== undefined ||
+              breakdown[`${base}_p`] !== undefined ||
+              breakdown[`${base}_w`] !== undefined;
+            if (hasGender) {
+              total +=
+                (Number(breakdown[`${base}_l`]) || 0) +
+                (Number(breakdown[`${base}_p`]) || 0) +
+                (Number(breakdown[`${base}_w`]) || 0);
+            } else {
+              total += Number(breakdown[base]) || 0;
+            }
+          }
+          return total;
+        };
+        const sumClasses: number = computeBreakdownTotal(bd);
+        if (sumClasses > 0) {
+          if (itemCat === 'Balita / Posyandu' || itemKlas === 'Porsi Balita') {
+            balita = sumClasses;
+            siswa = 0;
+            kategori = 'Balita';
+          } else if (itemCat === 'Bumil & Busui' || itemKlas === 'Porsi Ibu Hamil' || itemKlas === 'Porsi Ibu Menyusui') {
+            ibuHamil = Math.ceil(sumClasses / 2);
+            ibuMenyusui = Math.floor(sumClasses / 2);
+            siswa = 0;
+            kategori = 'Ibu Hamil';
+          } else {
+            siswa = sumClasses;
+            kategori = 'Siswa';
+          }
+        } else if (itemKlas === 'Porsi Balita' || itemKlas === 'Balita' || normInstansi.includes('balita')) {
+          balita = Number(item.targetBalita ?? item.targetSiswa) || 0;
+          kategori = 'Balita';
+        } else if (itemKlas === 'Porsi Ibu Hamil' || normInstansi.includes('ibu hamil') || (normInstansi.includes('hamil') && !normInstansi.includes('menyusui'))) {
+          ibuHamil = Number(item.targetBumilBusui ?? item.targetSiswa) || 0;
+          kategori = 'Ibu Hamil';
+        } else if (itemKlas === 'Porsi Ibu Menyusui' || normInstansi.includes('ibu menyusui') || normInstansi.includes('menyusui')) {
+          ibuMenyusui = Number(item.targetBumilBusui ?? item.targetSiswa) || 0;
+          kategori = 'Ibu Menyusui';
+        } else if (itemKlas === 'Bumil & Busui') {
+          const val = Number(item.targetBumilBusui ?? item.targetSiswa) || 0;
+          ibuHamil = Math.ceil(val / 2);
+          ibuMenyusui = Math.floor(val / 2);
+          kategori = 'Ibu Hamil';
+        } else {
+          siswa = Number(item.targetSiswa) || 0;
+          kategori = 'Siswa';
+        }
+      }
+    } else {
+      if (itemKlas === 'Porsi Balita' || itemKlas === 'Balita' || normInstansi.includes('balita')) {
+        kategori = 'Balita';
+      } else if (itemKlas === 'Porsi Ibu Hamil' || normInstansi.includes('ibu hamil')) {
+        kategori = 'Ibu Hamil';
+      } else if (itemKlas === 'Porsi Ibu Menyusui' || normInstansi.includes('ibu menyusui')) {
+        kategori = 'Ibu Menyusui';
+      }
+    }
+
+    const total = siswa + guru + balita + ibuHamil + ibuMenyusui;
+
+    const statusNote =
+      statusKbm === 'Libur Sebagian'
+        ? `Libur Sebagian: ${item.keteranganLibur || '-'}`
+        : statusKbm === 'Libur Full'
+        ? 'Libur Full'
+        : 'Aktif';
+    const combinedKeterangan = item.keterangan
+      ? `${statusNote} • ${item.keterangan}`
+      : statusNote;
+
+    return {
+      id: `BEN-${tanggal}-${String(idx + 1).padStart(3, '0')}`,
+      tanggal,
+      groupId: matchedGroup?.id || matchedLoc?.groupId || item.groupId || `GRP-${idx + 1}`,
+      groupNama: groupName,
+      locationId: item.id || matchedLoc?.id || `LOC-${idx + 1}`,
+      namaInstansi: item.namaInstansi || `Instansi ${idx + 1}`,
+      kategori,
+      kategoriLembaga: itemCat,
+      breakdownKelas: bd,
+      klasifikasiPorsi: itemKlas,
+      statusKbm,
+      keteranganLibur: item.keteranganLibur || '',
+      catatan: statusNote,
+      rincianSasaran: {
+        siswa,
+        guru,
+        balita,
+        ibuHamil,
+        ibuMenyusui,
+        breakdownKelas: bd
+      },
+      jumlahAwal: total,
+      penambahan: 0,
+      pengurangan: 0,
+      totalPenerima: total,
+      keterangan: combinedKeterangan,
+      status: finalStatus,
+      finalizedBy: finalStatus === 'FINAL' ? operatorName : undefined,
+      finalizedAt: finalStatus === 'FINAL' ? nowStr : undefined,
+      createdBy: operatorName,
+      createdAt: nowStr
+    };
+  });
+
+  dbStore.dailyBeneficiaryRecords.push(...newRecords);
+  syncSaveBatch('dailyBeneficiaryRecords', newRecords);
+
+  dbStore.beneficiaryLockStatus[tanggal] = {
+    status: finalStatus,
+    finalizedBy: finalStatus === 'FINAL' ? operatorName : undefined,
+    finalizedAt: finalStatus === 'FINAL' ? nowStr : undefined
+  };
+  syncSaveDoc('beneficiaryLocks', tanggal, { id: tanggal, ...dbStore.beneficiaryLockStatus[tanggal] });
+
+  const updatedSummary = dbStore.getBeneficiarySummaryForDate(tanggal);
+
+  dbStore.addLog(
+    userId || 'USR-001',
+    operatorName,
+    'Penerima Manfaat',
+    'Buat Perencanaan Penerima Manfaat',
+    `Menyimpan perencanaan penerima manfaat tanggal ${tanggal} (${newRecords.length} lembaga, Status: ${finalStatus}, Total: ${updatedSummary.totalPorsi} porsi)`
+  );
+
+  res.json({
+    success: true,
+    tanggal,
+    records: newRecords,
+    summary: updatedSummary,
+    message: `Perencanaan penerima manfaat tanggal ${tanggal} berhasil disimpan (${finalStatus})`
+  });
+});
+
+// 8. POST RECORD (Create / Update Daily Beneficiary Entry)
+router.post('/record', (req: Request, res: Response): void => {
+  const data = req.body;
+  if (!data.tanggal || !data.namaInstansi) {
+    res.status(400).json({ success: false, message: 'Tanggal dan Nama Instansi wajib diisi' });
+    return;
+  }
+
+  // Check lock status
+  const summary = dbStore.getBeneficiarySummaryForDate(data.tanggal);
+  if (summary.hasPlanning && summary.statusLock === 'FINAL' && data.userRole !== 'Admin' && data.userRole !== 'Admin Penuh' && data.userRole !== 'Super Admin') {
+    res.status(403).json({ success: false, message: 'Data untuk tanggal ini sudah DIFINALISASI / DIKUNCI. Memerlukan hak akses Admin untuk mengubah.' });
+    return;
+  }
+
+  const jumlahAwal = Number(data.jumlahAwal) || 0;
+  const penambahan = Number(data.penambahan) || 0;
+  const pengurangan = Number(data.pengurangan) || 0;
+  const totalPenerima = Math.max(0, jumlahAwal + penambahan - pengurangan);
+
+  const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  let existingIdx = -1;
+  if (data.id) {
+    existingIdx = dbStore.dailyBeneficiaryRecords.findIndex(r => r.id === data.id);
+  } else {
+    existingIdx = dbStore.dailyBeneficiaryRecords.findIndex(
+      r => r.tanggal === data.tanggal && r.namaInstansi.trim().toLowerCase() === data.namaInstansi.trim().toLowerCase()
+    );
+  }
+
+  let savedRecord: DailyBeneficiaryRecord;
+
+  if (existingIdx !== -1) {
+    const prevRec = dbStore.dailyBeneficiaryRecords[existingIdx];
+    const prevTotal = prevRec.totalPenerima;
+
+    savedRecord = {
+      ...prevRec,
+      groupId: data.groupId || prevRec.groupId,
+      groupNama: data.groupNama || prevRec.groupNama,
+      locationId: data.locationId || prevRec.locationId,
+      namaInstansi: data.namaInstansi || prevRec.namaInstansi,
+      kategori: data.kategori || prevRec.kategori,
+      klasifikasiPorsi: data.klasifikasiPorsi || prevRec.klasifikasiPorsi,
+      statusKbm: data.statusKbm || prevRec.statusKbm,
+      keteranganLibur: data.keteranganLibur !== undefined ? data.keteranganLibur : prevRec.keteranganLibur,
+      rincianSasaran: data.rincianSasaran || prevRec.rincianSasaran,
+      jumlahAwal,
+      penambahan,
+      pengurangan,
+      totalPenerima,
+      status: data.status || prevRec.status,
+      keterangan: data.keterangan !== undefined ? data.keterangan : prevRec.keterangan,
+      updatedBy: data.userName || 'Operator',
+      updatedAt: nowStr
+    };
+
+    dbStore.dailyBeneficiaryRecords[existingIdx] = savedRecord;
+
+    // Log Audit if amount changed
+    if (prevTotal !== totalPenerima) {
+      const auditLog: BeneficiaryAuditLog = {
+        id: `AUD-${Date.now()}`,
+        recordId: savedRecord.id,
+        namaInstansi: savedRecord.namaInstansi,
+        tanggal: savedRecord.tanggal,
+        jam: new Date().toTimeString().slice(0, 8),
+        user: data.userName || 'Operator',
+        dataSebelum: prevTotal,
+        dataSesudah: totalPenerima,
+        selisih: totalPenerima - prevTotal,
+        keterangan: data.keterangan || 'Perubahan jumlah penerima'
+      };
+      dbStore.beneficiaryAuditLogs.unshift(auditLog);
+    }
+
+    dbStore.addLog(data.userId || 'USR-001', data.userName || 'Operator', 'Penerima Manfaat', 'Update Penerima', `Update ${savedRecord.namaInstansi}: ${prevTotal} -> ${totalPenerima}`);
+  } else {
+    const currentLock = dbStore.beneficiaryLockStatus[data.tanggal]?.status;
+    const recStatus: 'DRAFT' | 'FINAL' = data.status === 'FINAL' || currentLock === 'FINAL' ? 'FINAL' : 'DRAFT';
+    const randSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+
+    savedRecord = {
+      id: `BEN-${data.tanggal}-${randSuffix}`,
+      tanggal: data.tanggal,
+      groupId: data.groupId || 'GRP-001',
+      groupNama: data.groupNama || 'Umum',
+      locationId: data.locationId || 'LOC-001',
+      namaInstansi: data.namaInstansi,
+      kategori: data.kategori || 'Siswa',
+      klasifikasiPorsi: data.klasifikasiPorsi,
+      statusKbm: data.statusKbm || 'Aktif',
+      keteranganLibur: data.keteranganLibur || '',
+      rincianSasaran: data.rincianSasaran,
+      jumlahAwal,
+      penambahan,
+      pengurangan,
+      totalPenerima,
+      keterangan: data.keterangan || '',
+      status: recStatus,
+      createdBy: data.userName || 'Operator',
+      createdAt: nowStr
+    };
+
+    dbStore.dailyBeneficiaryRecords.push(savedRecord);
+    dbStore.addLog(data.userId || 'USR-001', data.userName || 'Operator', 'Penerima Manfaat', 'Tambah Penerima', `Tambah ${savedRecord.namaInstansi}: Total ${totalPenerima}`);
+  }
+
+  syncSaveDoc('dailyBeneficiaryRecords', savedRecord.id, savedRecord);
+
+  const updatedSummary = dbStore.getBeneficiarySummaryForDate(data.tanggal);
+
+  res.json({
+    success: true,
+    data: savedRecord,
+    summary: updatedSummary,
+    message: 'Data penerima manfaat berhasil disimpan'
+  });
+});
+
+// 9. DELETE RECORD
+router.delete('/record/:id', (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const idx = dbStore.dailyBeneficiaryRecords.findIndex(r => r.id === id);
+  if (idx === -1) {
+    res.status(404).json({ success: false, message: 'Record penerima tidak ditemukan' });
+    return;
+  }
+
+  const targetRec = dbStore.dailyBeneficiaryRecords[idx];
+  const summary = dbStore.getBeneficiarySummaryForDate(targetRec.tanggal);
+
+  if (summary.statusLock === 'FINAL') {
+    res.status(403).json({ success: false, message: 'Data sudah DIFINALISASI. Buka kunci data terlebih dahulu untuk menghapus.' });
+    return;
+  }
+
+  dbStore.dailyBeneficiaryRecords.splice(idx, 1);
+  syncDeleteDoc('dailyBeneficiaryRecords', id);
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Hapus Penerima', `Menghapus record: ${targetRec.namaInstansi}`);
+
+  res.json({
+    success: true,
+    message: 'Data penerima berhasil dihapus'
+  });
+});
+
+// 9b. DELETE ALL RECORDS FOR A DATE
+router.delete('/records/date/:tanggal', (req: Request, res: Response): void => {
+  const { tanggal } = req.params;
+  const toDelete = dbStore.dailyBeneficiaryRecords.filter(r => r.tanggal === tanggal);
+  
+  if (toDelete.length > 0) {
+    dbStore.dailyBeneficiaryRecords = dbStore.dailyBeneficiaryRecords.filter(r => r.tanggal !== tanggal);
+    toDelete.forEach(r => syncDeleteDoc('dailyBeneficiaryRecords', r.id));
+  }
+
+  delete dbStore.beneficiaryLockStatus[tanggal];
+  syncDeleteDoc('beneficiaryLocks', tanggal);
+
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Hapus Rekap Harian', `Menghapus rekap harian tanggal ${tanggal}`);
+
+  res.json({
+    success: true,
+    message: `Data rekap harian tanggal ${tanggal} berhasil dihapus`
+  });
+});
+
+// 10. POST COPY PREVIOUS DAY DATA
+router.post('/copy-previous', (req: Request, res: Response): void => {
+  const { targetDate, sourceDate } = req.body;
+  if (!targetDate) {
+    res.status(400).json({ success: false, message: 'Tanggal target wajib diisi' });
+    return;
+  }
+
+  const copiedRecords = dbStore.copyBeneficiaryFromPreviousDay(targetDate, sourceDate);
+  if (copiedRecords.length === 0) {
+    res.status(400).json({
+      success: false,
+      message: 'Belum ada data perencanaan penerima manfaat pada hari sebelumnya untuk disalin. Silakan buat perencanaan terlebih dahulu melalui tombol Buat Penerima Manfaat.'
+    });
+    return;
+  }
+
+  dbStore.beneficiaryLockStatus[targetDate] = { status: 'DRAFT' };
+  syncSaveDoc('beneficiaryLocks', targetDate, { id: targetDate, status: 'DRAFT' });
+  syncSaveBatch('dailyBeneficiaryRecords', copiedRecords);
+  const summary = dbStore.getBeneficiarySummaryForDate(targetDate);
+
+  dbStore.addLog('USR-SYSTEM', 'Operator', 'Penerima Manfaat', 'Salin Data Hari Sebelumnya', `Menyalin data ke tanggal ${targetDate}`);
+
+  res.json({
+    success: true,
+    message: `Berhasil menyalin ${copiedRecords.length} data penerima ke tanggal ${targetDate} (Status: DRAFT)`,
+    records: copiedRecords,
+    summary
+  });
+});
+
+// 11. POST FINALIZE (LOCK DATA)
+router.post('/finalize', (req: Request, res: Response): void => {
+  const { tanggal, user } = req.body;
+  if (!tanggal) {
+    res.status(400).json({ success: false, message: 'Tanggal wajib diisi' });
+    return;
+  }
+
+  const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  dbStore.beneficiaryLockStatus[tanggal] = {
+    status: 'FINAL',
+    finalizedBy: user || 'Supervisor / Admin',
+    finalizedAt: nowStr
+  };
+
+  syncSaveDoc('beneficiaryLocks', tanggal, { id: tanggal, ...dbStore.beneficiaryLockStatus[tanggal] });
+
+  // Mark all records for this date as FINAL
+  const updatedForDate: DailyBeneficiaryRecord[] = [];
+  dbStore.dailyBeneficiaryRecords.forEach(r => {
+    if (r.tanggal === tanggal) {
+      r.status = 'FINAL';
+      r.finalizedBy = user || 'Supervisor / Admin';
+      r.finalizedAt = nowStr;
+      updatedForDate.push(r);
+    }
+  });
+
+  if (updatedForDate.length > 0) {
+    syncSaveBatch('dailyBeneficiaryRecords', updatedForDate);
+  }
+
+  dbStore.addLog('USR-SYSTEM', user || 'Supervisor', 'Penerima Manfaat', 'Finalisasi Data', `Data tanggal ${tanggal} difinalisasi / dikunci.`);
+
+  res.json({
+    success: true,
+    message: `Data penerima manfaat tanggal ${tanggal} berhasil DIFINALISASI & DIKUNCI serta ditampilkan di Dashboard.`,
+    summary: dbStore.getBeneficiarySummaryForDate(tanggal)
+  });
+});
+
+// 12. POST UNLOCK (BUKA LOCK DATA)
+router.post('/unlock', (req: Request, res: Response): void => {
+  const { tanggal, user } = req.body;
+  if (!tanggal) {
+    res.status(400).json({ success: false, message: 'Tanggal wajib diisi' });
+    return;
+  }
+
+  dbStore.beneficiaryLockStatus[tanggal] = {
+    status: 'DRAFT'
+  };
+
+  syncSaveDoc('beneficiaryLocks', tanggal, { id: tanggal, ...dbStore.beneficiaryLockStatus[tanggal] });
+
+  const updatedForDate: DailyBeneficiaryRecord[] = [];
+  dbStore.dailyBeneficiaryRecords.forEach(r => {
+    if (r.tanggal === tanggal) {
+      r.status = 'DRAFT';
+      updatedForDate.push(r);
+    }
+  });
+
+  if (updatedForDate.length > 0) {
+    syncSaveBatch('dailyBeneficiaryRecords', updatedForDate);
+  }
+
+  dbStore.addLog('USR-SYSTEM', user || 'Admin', 'Penerima Manfaat', 'Buka Finalisasi', `Kunci data tanggal ${tanggal} dibuka kembali.`);
+
+  res.json({
+    success: true,
+    message: `Kunci data penerima tanggal ${tanggal} berhasil DIBUKA (Status kembali ke DRAFT dan disembunyikan dari Dashboard).`,
+    summary: dbStore.getBeneficiarySummaryForDate(tanggal)
+  });
+});
+
+// 13. GET HISTORY / REKAP HARIAN
+router.get('/history', (req: Request, res: Response): void => {
+  const { startDate, endDate, groupId, locationId, search } = req.query as Record<string, string>;
+
+  let results = dbStore.dailyBeneficiaryRecords.filter(
+    r => r.createdBy !== 'System Copy' && !(r.createdBy === 'USR-001' && r.createdAt?.endsWith('06:30:00'))
+  );
+
+  if (startDate) {
+    results = results.filter(r => r.tanggal >= startDate);
+  }
+  if (endDate) {
+    results = results.filter(r => r.tanggal <= endDate);
+  }
+  if (groupId && groupId !== 'all') {
+    results = results.filter(r => r.groupId === groupId);
+  }
+  if (locationId && locationId !== 'all') {
+    results = results.filter(r => r.locationId === locationId);
+  }
+  if (search) {
+    const q = search.toLowerCase();
+    results = results.filter(r => 
+      r.namaInstansi.toLowerCase().includes(q) || 
+      r.groupNama.toLowerCase().includes(q) ||
+      r.kategori.toLowerCase().includes(q)
+    );
+  }
+
+  res.json({
+    success: true,
+    totalRecords: results.length,
+    data: results
+  });
+});
+
+// 14. GET REKAP BULANAN
+router.get('/rekap-bulanan', (req: Request, res: Response): void => {
+  const { bulan, tahun } = req.query as Record<string, string>;
+  const currentYear = tahun || new Date().getFullYear().toString();
+  const currentMonth = bulan ? String(bulan).padStart(2, '0') : String(new Date().getMonth() + 1).padStart(2, '0');
+
+  const prefix = `${currentYear}-${currentMonth}`;
+  const recs = dbStore.dailyBeneficiaryRecords.filter(
+    r => r.tanggal.startsWith(prefix) && r.createdBy !== 'System Copy' && !(r.createdBy === 'USR-001' && r.createdAt?.endsWith('06:30:00'))
+  );
+
+  // Group by date
+  const dateMap: Record<string, {
+    tanggal: string;
+    totalBalita: number;
+    totalIbuHamil: number;
+    totalIbuMenyusui: number;
+    totalSiswa: number;
+    totalGuru: number;
+    totalPenerima: number;
+  }> = {};
+
+  recs.forEach(r => {
+    if (!dateMap[r.tanggal]) {
+      dateMap[r.tanggal] = {
+        tanggal: r.tanggal,
+        totalBalita: 0,
+        totalIbuHamil: 0,
+        totalIbuMenyusui: 0,
+        totalSiswa: 0,
+        totalGuru: 0,
+        totalPenerima: 0
+      };
+    }
+
+    const item = dateMap[r.tanggal];
+    item.totalPenerima += r.totalPenerima;
+
+    if (r.rincianSasaran) {
+      if (r.statusKbm !== 'Libur Full' && r.totalPenerima > 0) {
+        const delta = (Number(r.penambahan) || 0) - (Number(r.pengurangan) || 0);
+        let s = Number(r.rincianSasaran.siswa) || 0;
+        let g = Number(r.rincianSasaran.guru) || 0;
+        let b = Number(r.rincianSasaran.balita) || 0;
+        let ih = Number(r.rincianSasaran.ibuHamil) || 0;
+        let im = Number(r.rincianSasaran.ibuMenyusui) || 0;
+
+        if (ih === 0 && im === 0 && r.breakdownKelas) {
+          ih = Number(r.breakdownKelas.bumil_w || r.breakdownKelas.bumil || 0);
+          im = Number(r.breakdownKelas.busui_w || r.breakdownKelas.busui || 0);
+        }
+
+        if (delta !== 0) {
+          if (b > 0 || r.kategori === 'Balita') b = Math.max(0, b + delta);
+          else if (ih > 0 || r.kategori === 'Ibu Hamil') ih = Math.max(0, ih + delta);
+          else if (im > 0 || r.kategori === 'Ibu Menyusui') im = Math.max(0, im + delta);
+          else if (s > 0 || r.kategori === 'Siswa') s = Math.max(0, s + delta);
+          else g = Math.max(0, g + delta);
+        }
+        item.totalSiswa += s;
+        item.totalGuru += g;
+        item.totalBalita += b;
+        item.totalIbuHamil += ih;
+        item.totalIbuMenyusui += im;
+      }
+    } else if (r.namaInstansi?.toLowerCase().includes('temenggungan') || r.namaInstansi?.toLowerCase().includes('posyandu') || r.groupNama?.toUpperCase().includes('3B')) {
+      const bd = r.breakdownKelas || {};
+      const b = (Number(bd.balita511_l) || 0) + (Number(bd.balita511_p) || 0) + (Number(bd.balita1259_l) || 0) + (Number(bd.balita1259_p) || 0);
+      const ih = Number(bd.bumil_w || bd.bumil || 0);
+      const im = Number(bd.busui_w || bd.busui || 0);
+      const k = (Number(bd.kader_l) || 0) + (Number(bd.kader_p) || 0) || Number(bd.kader) || 0;
+      item.totalBalita += b;
+      item.totalIbuHamil += ih;
+      item.totalIbuMenyusui += im;
+      item.totalGuru += k;
+    } else if (r.kategori === 'Balita' || r.groupNama.toUpperCase().includes('BALITA')) {
+      item.totalBalita += r.totalPenerima;
+    } else if (r.kategori === 'Ibu Hamil' || r.groupNama.toUpperCase().includes('HAMIL')) {
+      item.totalIbuHamil += r.totalPenerima;
+    } else if (r.kategori === 'Ibu Menyusui' || r.groupNama.toUpperCase().includes('MENYUSUI')) {
+      item.totalIbuMenyusui += r.totalPenerima;
+    } else if (r.kategori === 'Guru / Staf' || r.groupNama.toUpperCase().includes('GURU')) {
+      item.totalGuru += r.totalPenerima;
+    } else {
+      item.totalSiswa += r.totalPenerima;
+    }
+  });
+
+  const dailyList = Object.values(dateMap).sort((a, b) => a.tanggal.localeCompare(b.tanggal));
+
+  const totalHariProduksi = dailyList.length;
+  let totalPorsi = 0;
+  let maxPenerima = 0;
+  let minPenerima = dailyList.length > 0 ? dailyList[0].totalPenerima : 0;
+
+  dailyList.forEach(d => {
+    totalPorsi += d.totalPenerima;
+    if (d.totalPenerima > maxPenerima) maxPenerima = d.totalPenerima;
+    if (d.totalPenerima < minPenerima) minPenerima = d.totalPenerima;
+  });
+
+  const rataRataPerHari = totalHariProduksi > 0 ? Math.round(totalPorsi / totalHariProduksi) : 0;
+
+  res.json({
+    success: true,
+    bulan: currentMonth,
+    tahun: currentYear,
+    dailyList,
+    summary: {
+      totalHariProduksi,
+      totalPorsi,
+      rataRataPerHari,
+      maxPenerima,
+      minPenerima
+    }
+  });
+});
+
+// 15. GET AUDIT LOGS
+router.get('/audit-logs', (req: Request, res: Response): void => {
+  res.json({
+    success: true,
+    data: dbStore.beneficiaryAuditLogs
+  });
+});
+
+// 16. GET QUICK SUMMARY TARGET FOR OTHER MODULES (Produksi, Tugas Divisi, Dashboard)
+router.get('/summary', (req: Request, res: Response): void => {
+  const todayStr = new Date().toISOString().split('T')[0];
+  const tanggal = (req.query.tanggal as string) || todayStr;
+
+  const summary = dbStore.getBeneficiarySummaryForDate(tanggal);
+
+  res.json({
+    success: true,
+    tanggal,
+    summary
+  });
+});
+
+// ==========================================
+// 17. BAST (BERITA ACARA SERAH TERIMA) ENDPOINTS
+// ==========================================
+
+// GET /api/v1/penerima-manfaat/bast
+router.get('/bast', (req: Request, res: Response): void => {
+  try {
+    const { tanggal, startDate, endDate, search } = req.query;
+    const docs = dbStore.getBastDocuments({
+      tanggal: typeof tanggal === 'string' && tanggal !== 'all' ? tanggal : undefined,
+      startDate: typeof startDate === 'string' ? startDate : undefined,
+      endDate: typeof endDate === 'string' ? endDate : undefined,
+      search: typeof search === 'string' ? search : undefined
+    });
+
+    res.json({
+      success: true,
+      data: docs
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal mengambil data BAST', error: error.message });
+  }
+});
+
+// GET /api/v1/penerima-manfaat/bast/config
+router.get('/bast/config', (req: Request, res: Response): void => {
+  res.json({
+    success: true,
+    data: dbStore.bastNumberConfig
+  });
+});
+
+// POST /api/v1/penerima-manfaat/bast/config
+router.post('/bast/config', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const updated = dbStore.saveBastNumberConfig(req.body);
+    await syncSaveDoc('configs', 'bastNumberConfig', updated);
+    dbStore.addLog('USR-ADMIN', req.body.adminName || 'Admin SPPG', 'BAST', 'Konfigurasi Nomor BAST', `Memperbarui konfigurasi nomor surat BAST: Mulai ${updated.startNumber}, Digit ${updated.digitCount}, Instansi ${updated.kodeInstansi}`);
+    res.json({
+      success: true,
+      message: 'Konfigurasi nomor urut surat BAST berhasil disimpan',
+      data: updated
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal menyimpan konfigurasi nomor BAST', error: error.message });
+  }
+});
+
+// GET /api/v1/penerima-manfaat/bast/next-number
+router.get('/bast/next-number', (req: Request, res: Response): void => {
+  const tanggal = (req.query.tanggal as string) || new Date().toISOString().split('T')[0];
+  const nextNumber = dbStore.generateBastNumber(tanggal);
+  res.json({
+    success: true,
+    data: {
+      tanggal,
+      nextNumber,
+      config: dbStore.bastNumberConfig
+    }
+  });
+});
+
+// GET /api/v1/penerima-manfaat/bast/:id
+router.get('/bast/:id', (req: Request, res: Response): void => {
+  try {
+    const doc = dbStore.getBastById(req.params.id);
+    if (!doc) {
+      res.status(404).json({ success: false, message: 'Dokumen BAST tidak ditemukan' });
+      return;
+    }
+    res.json({ success: true, data: doc });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal mengambil detail BAST', error: error.message });
+  }
+});
+
+// POST /api/v1/penerima-manfaat/bast/generate
+router.post('/bast/generate', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { tanggal, force } = req.body;
+    if (!tanggal) {
+      res.status(400).json({ success: false, message: 'Parameter tanggal wajib diisi' });
+      return;
+    }
+
+    const docs = dbStore.generateDailyBastBatch(tanggal, Boolean(force));
+    for (const d of docs) {
+      await syncSaveDoc('bastDocuments', d.id, d);
+    }
+
+    res.json({
+      success: true,
+      message: `Berhasil generate ${docs.length} dokumen BAST untuk tanggal ${tanggal}`,
+      data: docs
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal generate BAST harian', error: error.message });
+  }
+});
+
+// POST /api/v1/penerima-manfaat/bast
+router.post('/bast', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const saved = dbStore.saveBastDocument(req.body);
+    await syncSaveDoc('bastDocuments', saved.id, saved);
+    res.json({
+      success: true,
+      message: 'Dokumen BAST berhasil disimpan',
+      data: saved
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal menyimpan BAST', error: error.message });
+  }
+});
+
+// PUT /api/v1/penerima-manfaat/bast/:id
+router.put('/bast/:id', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const existing = dbStore.getBastById(req.params.id);
+    if (!existing) {
+      res.status(404).json({ success: false, message: 'Dokumen BAST tidak ditemukan' });
+      return;
+    }
+
+    const updated = dbStore.saveBastDocument({
+      ...existing,
+      ...req.body,
+      id: req.params.id
+    });
+
+    if (req.body.namaPic || req.body.telponPic) {
+      const locIdx = dbStore.beneficiaryLocations.findIndex(l =>
+        l.id === updated.instansiId ||
+        l.namaInstansi.trim().toLowerCase() === updated.namaSekolah.trim().toLowerCase()
+      );
+      if (locIdx !== -1) {
+        if (req.body.namaPic) dbStore.beneficiaryLocations[locIdx].picNama = req.body.namaPic;
+        if (req.body.telponPic) {
+          dbStore.beneficiaryLocations[locIdx].picTelepon = req.body.telponPic;
+          dbStore.beneficiaryLocations[locIdx].kontak = req.body.telponPic;
+        }
+        await syncSaveDoc('beneficiaryLocations', dbStore.beneficiaryLocations[locIdx].id, dbStore.beneficiaryLocations[locIdx]);
+      }
+    }
+
+    await syncSaveDoc('bastDocuments', updated.id, updated);
+
+    res.json({
+      success: true,
+      message: 'Dokumen BAST berhasil diperbarui',
+      data: updated
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal memperbarui BAST', error: error.message });
+  }
+});
+
+// POST /api/v1/penerima-manfaat/bast/:id/regenerate
+router.post('/bast/:id/regenerate', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const existing = dbStore.getBastById(req.params.id);
+    if (!existing) {
+      res.status(404).json({ success: false, message: 'Dokumen BAST tidak ditemukan' });
+      return;
+    }
+
+    const dailyRecs = dbStore.getBeneficiaryRecordsForDate(existing.tanggal);
+    const matching = dailyRecs.filter(r => {
+      let clean = r.namaInstansi.trim();
+      if (clean.includes(' (Guru)')) clean = clean.replace(' (Guru)', '').trim();
+      return r.locationId === existing.instansiId || clean.toLowerCase() === existing.namaSekolah.trim().toLowerCase();
+    });
+
+    const loc = dbStore.beneficiaryLocations.find(l => l.id === existing.instansiId || l.namaInstansi.trim().toLowerCase() === existing.namaSekolah.trim().toLowerCase());
+    let newCount = matching.reduce((sum, r) => sum + (Number(r.totalPenerima) || 0), 0);
+    if (newCount === 0) {
+      newCount = loc?.defaultJumlah || existing.jumlahPaketMakanan;
+    }
+
+    const updated = dbStore.saveBastDocument({
+      ...existing,
+      npsn: existing.npsn || loc?.npsn || '',
+      jumlahPaketMakanan: newCount,
+      jumlahAlatMakan: newCount,
+      updatedAt: new Date().toISOString()
+    });
+
+    await syncSaveDoc('bastDocuments', updated.id, updated);
+
+    res.json({
+      success: true,
+      message: `BAST ${updated.nomorBast} berhasil digenerate ulang dengan jumlah ${newCount} paket.`,
+      data: updated
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal meregenerasi BAST', error: error.message });
+  }
+});
+
+// DELETE /api/v1/penerima-manfaat/bast/:id
+router.delete('/bast/:id', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const success = dbStore.deleteBastDocument(req.params.id);
+    if (success) {
+      await syncDeleteDoc('bastDocuments', req.params.id);
+      res.json({ success: true, message: 'Dokumen BAST berhasil dihapus' });
+    } else {
+      res.status(404).json({ success: false, message: 'Dokumen BAST tidak ditemukan' });
+    }
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal menghapus BAST', error: error.message });
+  }
+});
+
+// GET /api/v1/penerima-manfaat/bast/:id/docx
+router.get('/bast/:id/docx', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const doc = dbStore.getBastById(req.params.id);
+    if (!doc) {
+      res.status(404).json({ success: false, message: 'Dokumen BAST tidak ditemukan' });
+      return;
+    }
+
+    const syncedDoc = {
+      ...doc,
+      namaPetugasDistribusi: dbStore.getDistribusiSignerName(doc.namaPetugasDistribusi || 'Abdus Salam')
+    };
+    const wordDoc = await createBastWordDocument(syncedDoc);
+    const buffer = await Packer.toBuffer(wordDoc);
+
+    const cleanSchool = doc.namaSekolah.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const filename = `BAST_${cleanSchool}_${doc.tanggal}.docx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(buffer);
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: 'Gagal mengunduh dokumen Word', error: error.message });
+  }
+});
+
+export default router;
