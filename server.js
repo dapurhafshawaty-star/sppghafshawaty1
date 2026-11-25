@@ -1,5 +1,8 @@
 import fs from 'node:fs';
 import { execSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 if (!process.env.NODE_ENV) {
   process.env.NODE_ENV = 'production';
@@ -10,4 +13,4 @@ if (!fs.existsSync('./dist/server.cjs')) {
   execSync('npm run build', { stdio: 'inherit' });
 }
 
-await import('./dist/server.cjs');
+require('./dist/server.cjs');
